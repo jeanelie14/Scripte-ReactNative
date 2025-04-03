@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const {execSync, exec} = require('child_process');
 const readline = require('readline');
-const {promisify} = require('util');
+const { promisify } = require('util');
 const os = require('os');
 const semver = require('semver');
 const fetch = require('node-fetch');
@@ -21,6 +21,7 @@ const CONFIG = {
     'https://raw.githubusercontent.com/react-native-community/rn-diff-purge/master/version-react-native.json',
   logDir: path.join(os.homedir(), 'npm_updater_logs'),
   maxParallelRequests: 5,
+  stateFile: path.join(os.tmpdir(), 'npm_updater_state.json'),
 };
 
 // Couleurs ANSI
@@ -36,8 +37,8 @@ const COLORS = {
 
 const style = (text, color) => `${color}${text}${COLORS.reset}`;
 
-// Logs globaux
-const GLOBAL_LOGS = {
+// Logs globaux et état
+const STATE = {
   startTime: new Date(),
   operations: [],
   updatedPackages: [],
@@ -45,7 +46,29 @@ const GLOBAL_LOGS = {
   securityIssues: [],
   errors: [],
   createdFiles: [],
+  completedSteps: [],
 };
+
+// Charger l'état précédent
+function loadState() {
+  try {
+    if (fs.existsSync(CONFIG.stateFile)) {
+      return JSON.parse(fs.readFileSync(CONFIG.stateFile, 'utf8'));
+    }
+  } catch (e) {
+    // Ignorer les erreurs de lecture
+  }
+  return {completedSteps: []};
+}
+
+// Sauvegarder l'état
+function saveState() {
+  try {
+    fs.writeFileSync(CONFIG.stateFile, JSON.stringify(STATE, null, 2));
+  } catch (e) {
+    // Ignorer les erreurs d'écriture
+  }
+}
 
 // Interface utilisateur améliorée
 class UI {
@@ -122,14 +145,14 @@ class UI {
 
 // Gestionnaire de fichiers
 class FileManager {
-  static ensureLogsDirectory() {
-    if (!fs.existsSync(CONFIG.logDir)) {
-      fs.mkdirSync(CONFIG.logDir, {recursive: true});
+  static ensureDirectory(dirPath) {
+    if (!fs.existsSync(dirPath)) {
+      fs.mkdirSync(dirPath, {recursive: true});
     }
   }
 
   static async saveLogFile(content) {
-    this.ensureLogsDirectory();
+    this.ensureDirectory(CONFIG.logDir);
     const timestamp = moment().format('YYYY-MM-DD_HH-mm-ss');
     const logFileName = `npm_update_${timestamp}.log`;
     const logPath = path.join(CONFIG.logDir, logFileName);
@@ -154,17 +177,15 @@ class FileManager {
         try {
           if (isFile) {
             const dir = path.dirname(fullPath);
-            if (!fs.existsSync(dir)) {
-              fs.mkdirSync(dir, {recursive: true});
-            }
+            this.ensureDirectory(dir);
             fs.writeFileSync(fullPath, '');
-            GLOBAL_LOGS.createdFiles.push(`Fichier créé: ${fullPath}`);
+            STATE.createdFiles.push(`Fichier créé: ${fullPath}`);
           } else {
             fs.mkdirSync(fullPath, {recursive: true});
-            GLOBAL_LOGS.createdFiles.push(`Dossier créé: ${fullPath}`);
+            STATE.createdFiles.push(`Dossier créé: ${fullPath}`);
           }
         } catch (error) {
-          GLOBAL_LOGS.errors.push(
+          STATE.errors.push(
             `Erreur création ${isFile ? 'fichier' : 'dossier'} ${trimmed}: ${
               error.message
             }`,
@@ -182,6 +203,7 @@ class DependencyManager {
     this.packageData = null;
     this.updateStrategy = 1;
     this.apiClient = new ApiClient();
+    this.previousState = loadState();
   }
 
   async initialize() {
@@ -190,6 +212,16 @@ class DependencyManager {
   }
 
   async handlePackageJson() {
+    if (this.isStepCompleted('packageJsonHandled')) {
+      console.log(
+        style(
+          "\nPackage.json déjà traité lors d'une précédente exécution.",
+          COLORS.info,
+        ),
+      );
+      return;
+    }
+
     const existingPackageJson = FileManager.findPackageJson();
 
     if (existingPackageJson) {
@@ -235,6 +267,8 @@ class DependencyManager {
         process.exit(0);
       }
     }
+
+    this.markStepCompleted('packageJsonHandled');
   }
 
   async getCustomPackageJson() {
@@ -261,6 +295,17 @@ class DependencyManager {
               COLORS.success,
             ),
           );
+
+          // Écrire le package.json personnalisé dans le répertoire
+          this.packageJsonPath = path.join(process.cwd(), 'package.json');
+          fs.writeFileSync(this.packageJsonPath, input);
+          console.log(
+            style(
+              'Nouveau package.json enregistré dans le projet.',
+              COLORS.success,
+            ),
+          );
+
           resolve();
         } catch (e) {
           console.log(
@@ -273,12 +318,21 @@ class DependencyManager {
         }
       });
 
-      // Pour permettre à l'utilisateur de terminer la saisie
       process.stdin.on('close', resolve);
     });
   }
 
   async handleProjectStructure() {
+    if (this.isStepCompleted('projectStructureHandled')) {
+      console.log(
+        style(
+          "\nStructure du projet déjà traitée lors d'une précédente exécution.",
+          COLORS.info,
+        ),
+      );
+      return;
+    }
+
     const hasStructure = await UI.confirm(
       '\nAvez-vous une structure spécifique pour votre application?',
     );
@@ -300,18 +354,31 @@ class DependencyManager {
       });
 
       await new Promise(resolve => {
-        process.stdin.on('end', () => {
-          FileManager.createProjectStructure(structure);
-          if (GLOBAL_LOGS.createdFiles.length > 0) {
+        process.stdin.on('end', async () => {
+          await FileManager.createProjectStructure(structure);
+          if (STATE.createdFiles.length > 0) {
             console.log(
               style('\nStructure créée avec succès:', COLORS.success),
             );
-            GLOBAL_LOGS.createdFiles.forEach(item => console.log(` - ${item}`));
+            STATE.createdFiles.forEach(item => console.log(` - ${item}`));
           }
           resolve();
         });
         process.stdin.on('close', resolve);
       });
+    }
+
+    this.markStepCompleted('projectStructureHandled');
+  }
+
+  isStepCompleted(step) {
+    return this.previousState.completedSteps.includes(step);
+  }
+
+  markStepCompleted(step) {
+    if (!STATE.completedSteps.includes(step)) {
+      STATE.completedSteps.push(step);
+      saveState();
     }
   }
 
@@ -319,9 +386,7 @@ class DependencyManager {
     try {
       const content = fs.readFileSync(this.packageJsonPath, 'utf8');
       this.packageData = JSON.parse(content);
-      GLOBAL_LOGS.originalPackage = JSON.parse(
-        JSON.stringify(this.packageData),
-      );
+      STATE.originalPackage = JSON.parse(JSON.stringify(this.packageData));
       console.log(style('Package.json chargé avec succès!', COLORS.success));
     } catch (error) {
       console.log(style('Erreur de lecture du package.json', COLORS.error));
@@ -330,6 +395,16 @@ class DependencyManager {
   }
 
   async checkDependencies() {
+    if (this.isStepCompleted('dependenciesChecked')) {
+      console.log(
+        style(
+          "\nDépendances déjà vérifiées lors d'une précédente exécution.",
+          COLORS.info,
+        ),
+      );
+      return;
+    }
+
     UI.title('VÉRIFICATION DES DÉPENDANCES');
 
     this.updateStrategy = await this.askUpdateStrategy();
@@ -344,6 +419,8 @@ class DependencyManager {
     await this.checkDependencyCategory('dependencies');
     await this.checkDependencyCategory('devDependencies');
     await this.checkPeerDependencies();
+
+    this.markStepCompleted('dependenciesChecked');
   }
 
   async askUpdateStrategy() {
@@ -358,6 +435,8 @@ class DependencyManager {
   }
 
   async checkNodeVersion() {
+    if (this.isStepCompleted('nodeVersionChecked')) return;
+
     UI.title('VÉRIFICATION DE NODE.JS');
 
     try {
@@ -375,7 +454,7 @@ class DependencyManager {
           'Voulez-vous mettre à jour Node.js?',
         );
         if (shouldUpdate) {
-          this.updateNodeVersion(recommendedNode);
+          await this.updateNodeVersion(recommendedNode);
         }
       } else {
         console.log(style('✅ Version Node.js compatible', COLORS.success));
@@ -384,8 +463,10 @@ class DependencyManager {
       console.log(
         style('⚠️ Impossible de vérifier la version Node.js', COLORS.error),
       );
-      GLOBAL_LOGS.errors.push(`Node.js version check failed: ${error.message}`);
+      STATE.errors.push(`Node.js version check failed: ${error.message}`);
     }
+
+    this.markStepCompleted('nodeVersionChecked');
   }
 
   async getRecommendedNodeVersion() {
@@ -398,13 +479,13 @@ class DependencyManager {
     }
   }
 
-  updateNodeVersion(version) {
+  async updateNodeVersion(version) {
     try {
       console.log(style('\nOptions de mise à jour:', COLORS.info));
       console.log('1) Utiliser nvm (recommandé)');
       console.log('2) Télécharger manuellement');
 
-      const choice = UI.ask('Votre choix (1-2):');
+      const choice = await UI.ask('Votre choix (1-2):');
       if (choice === '1') {
         execSync(`nvm install ${version}`, {stdio: 'inherit'});
       } else {
@@ -418,17 +499,20 @@ class DependencyManager {
       }
     } catch (error) {
       console.log(style('Échec de la mise à jour de Node.js', COLORS.error));
-      GLOBAL_LOGS.errors.push(`Failed to update Node.js: ${error.message}`);
+      STATE.errors.push(`Failed to update Node.js: ${error.message}`);
     }
   }
 
   async checkReactNativeCompatibility() {
-    if (
-      !this.packageData.dependencies ||
-      !this.packageData.dependencies['react-native']
-    ) {
-      return;
-    }
+    if (this.isStepCompleted('reactNativeChecked')) return;
+  if (
+    !this.packageData.dependencies ||
+    !this.packageData.dependencies['react-native']
+  ) {
+    console.log('⚠️ Dépendances React Native introuvables dans package.json');
+    return;
+  }
+
 
     UI.title('VÉRIFICATION REACT NATIVE');
 
@@ -472,11 +556,14 @@ class DependencyManager {
       console.log(
         style('⚠️ Erreur de vérification React Native', COLORS.error),
       );
-      GLOBAL_LOGS.errors.push(`React Native check failed: ${error.message}`);
+      STATE.errors.push(`React Native check failed: ${error.message}`);
     }
+
+    this.markStepCompleted('reactNativeChecked');
   }
 
   async checkGradleCompatibility() {
+    if (this.isStepCompleted('gradleChecked')) return;
     if (!fs.existsSync(path.join(process.cwd(), 'android'))) {
       return;
     }
@@ -509,7 +596,13 @@ class DependencyManager {
           /gradle-(\d+\.\d+(\.\d+)?)-/,
         );
         if (gradleVersionMatch) {
-          const currentGradle = gradleVersionMatch[1];
+          let currentGradle = gradleVersionMatch[1];
+
+          // Correction pour le cas où la version serait "6.9" sans patch
+          if (currentGradle.split('.').length === 2) {
+            currentGradle += '.0';
+          }
+
           const recommendedGradle = await this.getRecommendedGradleVersion();
 
           console.log(
@@ -524,7 +617,7 @@ class DependencyManager {
               'Voulez-vous mettre à jour Gradle?',
             );
             if (shouldUpdate) {
-              this.updateGradleVersion(
+              await this.updateGradleVersion(
                 wrapperPropsPath,
                 buildGradlePath,
                 appBuildGradlePath,
@@ -538,8 +631,10 @@ class DependencyManager {
       }
     } catch (error) {
       console.log(style('⚠️ Erreur de vérification Gradle', COLORS.error));
-      GLOBAL_LOGS.errors.push(`Gradle check failed: ${error.message}`);
+      STATE.errors.push(`Gradle check failed: ${error.message}`);
     }
+
+    this.markStepCompleted('gradleChecked');
   }
 
   async getRecommendedGradleVersion() {
@@ -550,14 +645,14 @@ class DependencyManager {
       const majorVersion = semver.major(semver.coerce(cliVersion));
 
       if (majorVersion >= 7) return '7.5.1';
-      if (majorVersion >= 5) return '6.9';
-      return '6.3';
+      if (majorVersion >= 5) return '6.9.0'; // Correction pour avoir une version semver valide
+      return '6.3.0';
     } catch {
       return '7.5.1';
     }
   }
 
-  updateGradleVersion(wrapperPath, buildPath, appBuildPath, version) {
+  async updateGradleVersion(wrapperPath, buildPath, appBuildPath, version) {
     try {
       // Mise à jour gradle-wrapper.properties
       let wrapperContent = fs.readFileSync(wrapperPath, 'utf8');
@@ -591,7 +686,7 @@ class DependencyManager {
       console.log(
         style('⚠️ Erreur lors de la mise à jour de Gradle', COLORS.error),
       );
-      GLOBAL_LOGS.errors.push(`Gradle update failed: ${error.message}`);
+      STATE.errors.push(`Gradle update failed: ${error.message}`);
     }
   }
 
@@ -611,11 +706,15 @@ class DependencyManager {
     // Utilisation de Promise.allSettled pour paralléliser les requêtes
     const results = await Promise.allSettled(
       packages.map(async ([pkg, version]) => {
+        if (this.isPackageUpdated(pkg)) {
+          return {pkg, currentVersion: version, alreadyUpdated: true};
+        }
+
         try {
           const latestVersion = await this.apiClient.getLatestVersion(pkg);
           return {pkg, currentVersion: version, latestVersion};
         } catch (error) {
-          GLOBAL_LOGS.errors.push(`Failed to get version for ${pkg}`);
+          STATE.errors.push(`Failed to get version for ${pkg}`);
           return {
             pkg,
             currentVersion: version,
@@ -627,18 +726,21 @@ class DependencyManager {
     );
 
     for (const [index, result] of results.entries()) {
-      UI.progress(
-        index + 1,
-        total,
-        `Traitement de ${result.value?.pkg || packages[index][0]}`,
-      );
+      const pkgName = result.value?.pkg || packages[index][0];
+
+      if (result.value?.alreadyUpdated) {
+        UI.showCheck(
+          `${style(pkgName, COLORS.success)} - déjà mis à jour`,
+          true,
+        );
+        continue;
+      }
+
+      UI.progress(index + 1, total, `Traitement de ${pkgName}`);
 
       if (result.status === 'rejected' || result.value.error) {
         UI.showCheck(
-          `${style(
-            result.value?.pkg || packages[index][0],
-            COLORS.error,
-          )} - erreur de vérification`,
+          `${style(pkgName, COLORS.error)} - erreur de vérification`,
           false,
         );
         continue;
@@ -660,7 +762,7 @@ class DependencyManager {
       );
 
       if (isUpToDate) {
-        GLOBAL_LOGS.skippedPackages.push({pkg, currentVersion, latestVersion});
+        STATE.skippedPackages.push({pkg, currentVersion, latestVersion});
         UI.showCheck(
           `${style(pkg, COLORS.success)} est à jour (${style(
             currentVersion,
@@ -695,11 +797,12 @@ class DependencyManager {
             category === 'devDependencies',
           );
           updatedCount++;
-          GLOBAL_LOGS.updatedPackages.push({
+          STATE.updatedPackages.push({
             pkg,
             from: currentVersion,
             to: latestVersion,
           });
+          this.markPackageUpdated(pkg);
           UI.showCheck(
             `${style(pkg, COLORS.success)} mis à jour avec succès`,
             true,
@@ -708,13 +811,21 @@ class DependencyManager {
           await this.handlePackageError(pkg, currentVersion);
         }
       } else {
-        GLOBAL_LOGS.skippedPackages.push({pkg, currentVersion, latestVersion});
+        STATE.skippedPackages.push({pkg, currentVersion, latestVersion});
       }
     }
 
     UI.completeProgress(
       `\n${category}: ${updatedCount} packages mis à jour sur ${total}`,
     );
+  }
+
+  isPackageUpdated(pkg) {
+    return STATE.updatedPackages.some(item => item.pkg === pkg);
+  }
+
+  markPackageUpdated(pkg) {
+    saveState();
   }
 
   async installPackage(pkg, version, isDev = false) {
@@ -735,6 +846,7 @@ class DependencyManager {
   }
 
   async checkPeerDependencies() {
+    if (this.isStepCompleted('peerDependenciesChecked')) return;
     if (!this.packageData.peerDependencies) {
       return;
     }
@@ -780,11 +892,13 @@ class DependencyManager {
           }
         }
       } catch (error) {
-        GLOBAL_LOGS.errors.push(
+        STATE.errors.push(
           `Failed to check peerDependency ${pkg}: ${error.message}`,
         );
       }
     }
+
+    this.markStepCompleted('peerDependenciesChecked');
   }
 
   getInstalledVersion(pkg) {
@@ -806,7 +920,7 @@ class DependencyManager {
   }
 
   async handlePackageError(pkg, currentVersion) {
-    GLOBAL_LOGS.errors.push(`Échec de la mise à jour de ${pkg}`);
+    STATE.errors.push(`Échec de la mise à jour de ${pkg}`);
     UI.showCheck(
       `Échec de la mise à jour de ${style(pkg, COLORS.error)}`,
       false,
@@ -825,11 +939,12 @@ class DependencyManager {
       if (useAlternative) {
         try {
           await this.installPackage(alternative.name, 'latest');
-          GLOBAL_LOGS.updatedPackages.push({
+          STATE.updatedPackages.push({
             pkg: alternative.name,
             from: `(remplacement de ${pkg}@${currentVersion})`,
             to: 'latest',
           });
+          this.markPackageUpdated(alternative.name);
           console.log(
             style(
               `✅ ${alternative.name} installé avec succès`,
@@ -852,9 +967,9 @@ class DependencyManager {
     UI.title('RAPPORT FINAL');
 
     // Packages mis à jour
-    if (GLOBAL_LOGS.updatedPackages.length > 0) {
+    if (STATE.updatedPackages.length > 0) {
       console.log(style('\nPACKAGES MIS À JOUR:', COLORS.success));
-      GLOBAL_LOGS.updatedPackages.forEach(({pkg, from, to}) => {
+      STATE.updatedPackages.forEach(({pkg, from, to}) => {
         console.log(
           ` ${style('✓', COLORS.success)} ${style(
             pkg,
@@ -865,22 +980,20 @@ class DependencyManager {
     }
 
     // Packages déjà à jour
-    if (GLOBAL_LOGS.skippedPackages.length > 0) {
+    if (STATE.skippedPackages.length > 0) {
       console.log(style('\nPACKAGES DÉJÀ À JOUR:', COLORS.info));
-      GLOBAL_LOGS.skippedPackages
-        .slice(0, 10)
-        .forEach(({pkg, currentVersion}) => {
-          console.log(
-            ` ${style('✓', COLORS.success)} ${style(
-              pkg,
-              COLORS.highlight,
-            )} @ ${currentVersion}`,
-          );
-        });
-      if (GLOBAL_LOGS.skippedPackages.length > 10) {
+      STATE.skippedPackages.slice(0, 10).forEach(({pkg, currentVersion}) => {
+        console.log(
+          ` ${style('✓', COLORS.success)} ${style(
+            pkg,
+            COLORS.highlight,
+          )} @ ${currentVersion}`,
+        );
+      });
+      if (STATE.skippedPackages.length > 10) {
         console.log(
           style(
-            ` (+ ${GLOBAL_LOGS.skippedPackages.length - 10} autres packages)`,
+            ` (+ ${STATE.skippedPackages.length - 10} autres packages)`,
             COLORS.muted,
           ),
         );
@@ -888,17 +1001,17 @@ class DependencyManager {
     }
 
     // Fichiers créés
-    if (GLOBAL_LOGS.createdFiles.length > 0) {
+    if (STATE.createdFiles.length > 0) {
       console.log(style('\nSTRUCTURE CRÉÉE:', COLORS.info));
-      GLOBAL_LOGS.createdFiles.forEach(file => {
+      STATE.createdFiles.forEach(file => {
         console.log(` ${style('✓', COLORS.success)} ${file}`);
       });
     }
 
     // Erreurs
-    if (GLOBAL_LOGS.errors.length > 0) {
+    if (STATE.errors.length > 0) {
       console.log(style('\nERREURS RENCONTRÉES:', COLORS.error));
-      const uniqueErrors = [...new Set(GLOBAL_LOGS.errors)];
+      const uniqueErrors = [...new Set(STATE.errors)];
       uniqueErrors.slice(0, 20).forEach((error, i) => {
         console.log(` ${i + 1}) ${error}`);
       });
@@ -913,13 +1026,13 @@ class DependencyManager {
     }
 
     // Statistiques
-    const duration = moment.duration(moment().diff(GLOBAL_LOGS.startTime));
+    const duration = moment.duration(moment().diff(STATE.startTime));
     console.log(style('\nSTATISTIQUES:', COLORS.highlight));
     console.log(` Durée totale: ${duration.minutes()}m ${duration.seconds()}s`);
-    console.log(` Packages mis à jour: ${GLOBAL_LOGS.updatedPackages.length}`);
-    console.log(` Packages déjà à jour: ${GLOBAL_LOGS.skippedPackages.length}`);
-    console.log(` Fichiers/dossiers créés: ${GLOBAL_LOGS.createdFiles.length}`);
-    console.log(` Erreurs: ${GLOBAL_LOGS.errors.length}`);
+    console.log(` Packages mis à jour: ${STATE.updatedPackages.length}`);
+    console.log(` Packages déjà à jour: ${STATE.skippedPackages.length}`);
+    console.log(` Fichiers/dossiers créés: ${STATE.createdFiles.length}`);
+    console.log(` Erreurs: ${STATE.errors.length}`);
 
     await this.saveDetailedLog();
   }
@@ -927,32 +1040,30 @@ class DependencyManager {
   async saveDetailedLog() {
     const logContent = `
 === RAPPORT DE MISE À JOUR NPM ===
-Date: ${GLOBAL_LOGS.startTime.toISOString()}
-Durée: ${moment.duration(moment().diff(GLOBAL_LOGS.startTime)).humanize()}
+Date: ${STATE.startTime.toISOString()}
+Durée: ${moment.duration(moment().diff(STATE.startTime)).humanize()}
 Répertoire: ${process.cwd()}
 
 === PACKAGES MIS À JOUR ===
 ${
-  GLOBAL_LOGS.updatedPackages
-    .map(p => `${p.pkg}: ${p.from} → ${p.to}`)
-    .join('\n') || 'Aucun'
+  STATE.updatedPackages.map(p => `${p.pkg}: ${p.from} → ${p.to}`).join('\n') ||
+  'Aucun'
 }
 
 === PACKAGES DÉJÀ À JOUR ===
 ${
-  GLOBAL_LOGS.skippedPackages
-    .map(p => `${p.pkg} @ ${p.currentVersion}`)
-    .join('\n') || 'Aucun'
+  STATE.skippedPackages.map(p => `${p.pkg} @ ${p.currentVersion}`).join('\n') ||
+  'Aucun'
 }
 
 === STRUCTURE CRÉÉE ===
-${GLOBAL_LOGS.createdFiles.join('\n') || 'Aucune'}
+${STATE.createdFiles.join('\n') || 'Aucune'}
 
 === ERREURS ===
-${[...new Set(GLOBAL_LOGS.errors)].join('\n') || 'Aucune'}
+${[...new Set(STATE.errors)].join('\n') || 'Aucune'}
 
 === ANCIEN PACKAGE.JSON ===
-${JSON.stringify(GLOBAL_LOGS.originalPackage, null, 2) || 'Non disponible'}
+${JSON.stringify(STATE.originalPackage, null, 2) || 'Non disponible'}
 
 === NOUVEAU PACKAGE.JSON ===
 ${JSON.stringify(this.packageData, null, 2) || 'Non disponible'}
@@ -1030,27 +1141,6 @@ class ApiClient {
   }
 }
 
-// Fonction principale
-async function main() {
-  try {
-    console.clear();
-    UI.title('NPM PACKAGE UPDATER - OUTIL DE MISE À JOUR INTELLIGENT');
-
-    const manager = new DependencyManager();
-    await manager.initialize();
-    await manager.checkDependencies();
-    await manager.generateReport();
-
-    console.log('\n');
-    UI.separator();
-    console.log(style(' Opération terminée avec succès! ', COLORS.success));
-    UI.separator();
-  } catch (error) {
-    console.error(style('\nERREUR CRITIQUE:', COLORS.error), error);
-    process.exit(1);
-  }
-}
-
 // Vérification des dépendances requises
 async function checkDependencies() {
   try {
@@ -1058,6 +1148,7 @@ async function checkDependencies() {
     require('semver');
     require('node-fetch');
     require('moment');
+    require('opener');
   } catch (err) {
     console.log(style('Installation des dépendances requises...', COLORS.info));
     try {
@@ -1084,4 +1175,23 @@ async function checkDependencies() {
 }
 
 // Démarrer l'application
-checkDependencies().then(main);
+(async () => {
+  try {
+    await checkDependencies();
+    console.clear();
+    UI.title('NPM PACKAGE UPDATER - OUTIL DE MISE À JOUR INTELLIGENT');
+
+    const manager = new DependencyManager();
+    await manager.initialize();
+    await manager.checkDependencies();
+    await manager.generateReport();
+
+    console.log('\n');
+    UI.separator();
+    console.log(style(' Opération terminée avec succès! ', COLORS.success));
+    UI.separator();
+  } catch (error) {
+    console.error(style('\nERREUR CRITIQUE:', COLORS.error), error);
+    process.exit(1);
+  }
+})();
