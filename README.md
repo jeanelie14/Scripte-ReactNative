@@ -32,6 +32,10 @@ const STATE = {
   createdFiles: [],
   completedSteps: [],
   startTime: new Date(),
+  gradleVersion: null,
+  androidConfig: null,
+  reactVersion: null,
+  reactNativeVersion: null,
 };
 
 // Interface utilisateur
@@ -66,6 +70,259 @@ class UI {
     this.separator();
     console.log(` ${message} `.highlight.bold);
     this.separator();
+  }
+}
+
+// Gestionnaire de structure de projet
+class ProjectStructureManager {
+  static async createStructure() {
+    UI.title('STRUCTURATION DU PROJET');
+
+    const hasPredefinedStructure = await UI.confirm(
+      'Avez-vous une structure prédéfinie à créer ?',
+    );
+    if (!hasPredefinedStructure) return;
+
+    console.log(
+      '\nEntrez la structure de votre projet (un élément par ligne) :'.info,
+    );
+    console.log('Exemple:'.muted);
+    console.log('src/'.muted);
+    console.log('  components/'.muted);
+    console.log('    Button.js'.muted);
+    console.log('  assets/images/'.muted);
+    console.log('\nAppuyez sur Entrée deux fois pour terminer'.muted);
+
+    const structure = await readMultiLineInput();
+    if (structure.length === 0) {
+      console.log('Aucune structure à créer'.warning);
+      return;
+    }
+
+    console.log('\nCréation de la structure...'.info);
+    for (const item of structure) {
+      const fullPath = path.join(process.cwd(), item.trim());
+      try {
+        if (item.includes('.')) {
+          // C'est un fichier
+          const dir = path.dirname(fullPath);
+          if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, {recursive: true});
+          }
+          fs.writeFileSync(fullPath, '');
+          STATE.createdFiles.push(`Fichier créé: ${item}`);
+        } else {
+          // C'est un dossier
+          fs.mkdirSync(fullPath, {recursive: true});
+          STATE.createdFiles.push(`Dossier créé: ${item}`);
+        }
+      } catch (error) {
+        STATE.errors.push(`Erreur création ${item}: ${error.message}`);
+      }
+    }
+
+    console.log('Structure créée avec succès'.success);
+  }
+}
+
+// Gestionnaire d'environnement
+class EnvironmentManager {
+  static detectEnvironment(packageData) {
+    if (packageData.dependencies) {
+      STATE.reactVersion = packageData.dependencies.react;
+      STATE.reactNativeVersion = packageData.dependencies['react-native'];
+    }
+    this.detectGradleVersion();
+  }
+
+  static detectGradleVersion() {
+    try {
+      const wrapperPropsPath = path.join(
+        process.cwd(),
+        'android',
+        'gradle',
+        'wrapper',
+        'gradle-wrapper.properties',
+      );
+      if (fs.existsSync(wrapperPropsPath)) {
+        const content = fs.readFileSync(wrapperPropsPath, 'utf8');
+        const versionMatch = content.match(/gradle-(\d+\.\d+(\.\d+)?)-/);
+        if (versionMatch) {
+          STATE.gradleVersion = versionMatch[1];
+        }
+      }
+    } catch (error) {
+      console.log('Erreur lecture version Gradle'.error, error.message);
+    }
+  }
+
+  static async checkDependencyCompatibility(pkg, version) {
+    if (STATE.reactVersion && STATE.reactNativeVersion) {
+      const reactCompatibility = await this.checkReactCompatibility(
+        pkg,
+        version,
+      );
+      if (!reactCompatibility.compatible) {
+        return {
+          compatible: false,
+          message: `Incompatible avec React ${STATE.reactVersion} et React Native ${STATE.reactNativeVersion}`,
+        };
+      }
+    }
+
+    if (STATE.gradleVersion && this.isNativeDependency(pkg)) {
+      const gradleCompatibility = await this.checkGradleCompatibility(
+        pkg,
+        version,
+      );
+      if (!gradleCompatibility.compatible) {
+        return {
+          compatible: false,
+          message: `Incompatible avec Gradle ${STATE.gradleVersion}`,
+        };
+      }
+    }
+
+    return {compatible: true};
+  }
+
+  static async getCompatibleVersions(pkg, currentVersion) {
+    try {
+      const versions = await NpmApi.getPackageVersions(pkg);
+      const reactRange = STATE.reactVersion
+        ? `react@${STATE.reactVersion}`
+        : '';
+      const reactNativeRange = STATE.reactNativeVersion
+        ? `react-native@${STATE.reactNativeVersion}`
+        : '';
+
+      let compatibleVersions = versions.filter(
+        v =>
+          semver.satisfies(v, currentVersion) &&
+          this.checkPeerDependencies(pkg, v, reactRange, reactNativeRange),
+      );
+
+      if (compatibleVersions.length === 0) {
+        compatibleVersions = versions.filter(v =>
+          this.checkPeerDependencies(pkg, v, reactRange, reactNativeRange),
+        );
+      }
+
+      return compatibleVersions
+        .sort((a, b) => semver.rcompare(a, b))
+        .slice(0, 3);
+    } catch (error) {
+      console.log(
+        `Erreur recherche versions compatibles pour ${pkg}`.error,
+        error.message,
+      );
+      return [];
+    }
+  }
+
+  static async checkReactCompatibility(pkg, version) {
+    try {
+      const response = await fetch(`${CONFIG.npmRegistry}/${pkg}/${version}`);
+      if (!response.ok) return {compatible: false};
+
+      const pkgData = await response.json();
+      const peerDeps = pkgData.peerDependencies || {};
+
+      if (
+        peerDeps.react &&
+        !semver.satisfies(STATE.reactVersion, peerDeps.react)
+      ) {
+        return {
+          compatible: false,
+          message: `Nécessite React ${peerDeps.react} mais le projet utilise ${STATE.reactVersion}`,
+        };
+      }
+
+      if (
+        peerDeps['react-native'] &&
+        !semver.satisfies(STATE.reactNativeVersion, peerDeps['react-native'])
+      ) {
+        return {
+          compatible: false,
+          message: `Nécessite React Native ${peerDeps['react-native']} mais le projet utilise ${STATE.reactNativeVersion}`,
+        };
+      }
+
+      return {compatible: true};
+    } catch {
+      return {compatible: true};
+    }
+  }
+
+  static async checkGradleCompatibility(pkg, version) {
+    const gradleRequirements = {
+      'react-native': '>=6.0',
+      'react-native-reanimated': '>=6.0',
+      'react-native-gesture-handler': '>=6.0',
+      'react-native-screens': '>=6.0',
+      'react-native-vector-icons': '>=6.0',
+    };
+
+    if (gradleRequirements[pkg]) {
+      return {
+        compatible: semver.satisfies(
+          STATE.gradleVersion,
+          gradleRequirements[pkg],
+        ),
+        message: `Nécessite Gradle ${gradleRequirements[pkg]} mais le projet utilise ${STATE.gradleVersion}`,
+      };
+    }
+
+    return {compatible: true};
+  }
+
+  static async checkPeerDependencies(
+    pkg,
+    version,
+    reactRange,
+    reactNativeRange,
+  ) {
+    try {
+      const response = await fetch(`${CONFIG.npmRegistry}/${pkg}/${version}`);
+      if (!response.ok) return false;
+
+      const pkgData = await response.json();
+      const peerDeps = pkgData.peerDependencies || {};
+
+      if (
+        peerDeps.react &&
+        reactRange &&
+        !semver.satisfies(reactRange, peerDeps.react)
+      ) {
+        return false;
+      }
+
+      if (
+        peerDeps['react-native'] &&
+        reactNativeRange &&
+        !semver.satisfies(reactNativeRange, peerDeps['react-native'])
+      ) {
+        return false;
+      }
+
+      return true;
+    } catch {
+      return true;
+    }
+  }
+
+  static isNativeDependency(pkg) {
+    const nativeDependencies = [
+      'react-native',
+      'react-native-reanimated',
+      'react-native-gesture-handler',
+      'react-native-screens',
+      'react-native-vector-icons',
+      'react-native-camera',
+      'react-native-maps',
+    ];
+
+    return nativeDependencies.includes(pkg);
   }
 }
 
@@ -127,11 +384,9 @@ class PackageManager {
 
     for (const [pkg, version] of Object.entries(dependencies)) {
       try {
-        // Vérifier d'abord si la version existe
         const exists = await NpmApi.versionExists(pkg, version);
 
         if (!exists) {
-          // Trouver une version alternative compatible
           const compatibleVersion = await this.findCompatibleVersion(
             pkg,
             version,
@@ -175,7 +430,6 @@ class PackageManager {
     try {
       execSync(command, {stdio: 'inherit'});
     } catch (error) {
-      // Essayer sans version spécifique si l'installation échoue
       console.log(
         `Tentative d'installation sans version spécifique pour ${pkg}`.warning,
       );
@@ -188,10 +442,7 @@ class PackageManager {
 
   async findCompatibleVersion(pkg, requestedVersion) {
     try {
-      // Obtenir toutes les versions disponibles
       const versions = await NpmApi.getPackageVersions(pkg);
-
-      // Trouver la version la plus récente qui satisfait la plage demandée
       const version = versions
         .filter(v => semver.satisfies(v, requestedVersion))
         .sort((a, b) => semver.rcompare(a, b))[0];
@@ -279,41 +530,70 @@ class NpmApi {
   }
 }
 
-// Fonction principale
-async function main() {
-  console.clear();
-  UI.title('MISE À JOUR DE PROJET - DEEPSEEK');
+// Fonctions utilitaires
+async function readMultiLineInput() {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
 
-  const packageManager = new PackageManager();
-  const hasPackageJson = await packageManager.loadPackageJson();
+  return new Promise(resolve => {
+    const lines = [];
 
-  // Afficher le menu principal
-  console.log('\nBonjour, choisissez une option :'.info.bold);
-  console.log('1. Mettre à jour le package.json'.highlight);
-  console.log('2. Installer des dépendances'.highlight);
-  console.log('3. Comparer et mettre à jour les versions'.highlight);
+    rl.on('line', line => {
+      if (line.trim() === '' && lines.length > 0) {
+        rl.close();
+        resolve(lines);
+      } else if (line.trim() !== '') {
+        lines.push(line.trim());
+      }
+    });
 
-  const choice = await UI.ask('\nVotre choix (1-3) : ');
-
-  switch (choice) {
-    case '1':
-      await handlePackageJsonUpdate(packageManager, hasPackageJson);
-      break;
-    case '2':
-      await handleDependencyInstallation(packageManager);
-      break;
-    case '3':
-      await handleVersionComparison(packageManager, hasPackageJson);
-      break;
-    default:
-      console.log('Option invalide'.error);
-      process.exit(1);
-  }
-
-  // Afficher le rapport final
-  await generateReport();
+    setTimeout(() => {
+      if (lines.length > 0) {
+        rl.close();
+        resolve(lines);
+      }
+    }, 30000);
+  });
 }
 
+async function generateReport() {
+  UI.title('RAPPORT FINAL');
+
+  if (STATE.updatedPackages.length > 0) {
+    console.log('\nPACKAGES MIS À JOUR:'.success.bold);
+    STATE.updatedPackages.forEach(pkg => {
+      console.log(`- ${pkg.name.highlight}: ${pkg.from} → ${pkg.to}`);
+    });
+  }
+
+  if (STATE.skippedPackages.length > 0) {
+    console.log('\nPACKAGES NON MODIFIÉS:'.info.bold);
+    STATE.skippedPackages.forEach(pkg => {
+      console.log(`- ${pkg.name}: ${pkg.version}`);
+    });
+  }
+
+  if (STATE.createdFiles.length > 0) {
+    console.log('\nFICHIERS/DOOSSIERS CRÉÉS:'.info.bold);
+    STATE.createdFiles.forEach(file => {
+      console.log(`- ${file}`);
+    });
+  }
+
+  if (STATE.errors.length > 0) {
+    console.log('\nERREURS:'.error.bold);
+    STATE.errors.forEach((error, i) => {
+      console.log(`${i + 1}) ${error}`);
+    });
+  }
+
+  const duration = (new Date() - STATE.startTime) / 1000;
+  console.log(`\nTemps d'exécution: ${duration.toFixed(2)} secondes`.muted);
+}
+
+// Fonctions principales
 async function handlePackageJsonUpdate(packageManager, hasPackageJson) {
   UI.title('MISE À JOUR DU PACKAGE.JSON');
 
@@ -330,22 +610,28 @@ async function handlePackageJsonUpdate(packageManager, hasPackageJson) {
   );
   if (!shouldUpdate) return;
 
-  // Ici vous pourriez ajouter la logique pour mettre à jour le package.json
-  // selon vos besoins spécifiques
-
   console.log('Package.json mis à jour avec succès'.success);
 }
 
 async function handleDependencyInstallation(packageManager) {
   UI.title('INSTALLATION DE DÉPENDANCES');
 
+  if (STATE.reactVersion) {
+    console.log(`\nReact: ${STATE.reactVersion.highlight}`);
+  }
+  if (STATE.reactNativeVersion) {
+    console.log(`React Native: ${STATE.reactNativeVersion.highlight}`);
+  }
+  if (STATE.gradleVersion) {
+    console.log(`Gradle: ${STATE.gradleVersion.highlight}`);
+  }
+
   console.log(
-    'Entrez les dépendances à installer (format: nom@version) :'.info,
+    '\nEntrez les dépendances à installer (format: nom@version) :'.info,
   );
   console.log('Appuyez sur Entrée deux fois pour terminer'.muted);
 
   const dependencies = await readMultiLineInput();
-
   if (dependencies.length === 0) {
     console.log('Aucune dépendance à installer'.warning);
     return;
@@ -359,6 +645,62 @@ async function handleDependencyInstallation(packageManager) {
 
   console.log('\nDépendances à installer :'.info);
   console.log(depsToInstall);
+
+  // Vérifier la compatibilité
+  const compatibilityIssues = [];
+  for (const [pkg, version] of Object.entries(depsToInstall)) {
+    const compatibility = await EnvironmentManager.checkDependencyCompatibility(
+      pkg,
+      version,
+    );
+    if (!compatibility.compatible) {
+      const compatibleVersions = await EnvironmentManager.getCompatibleVersions(
+        pkg,
+        version,
+      );
+      compatibilityIssues.push({
+        pkg,
+        version,
+        message: compatibility.message,
+        compatibleVersions,
+      });
+
+      console.log(
+        `\n⚠️ ${pkg.highlight}@${version}: ${compatibility.message}`.warning,
+      );
+      if (compatibleVersions.length > 0) {
+        console.log(`Versions compatibles disponibles :`.info);
+        compatibleVersions.forEach(v => console.log(`- ${v}`.highlight));
+      } else {
+        console.log(`Aucune version compatible trouvée`.error);
+      }
+    }
+  }
+
+  if (compatibilityIssues.length > 0) {
+    const shouldContinue = await UI.confirm(
+      '\nContinuer malgré les problèmes de compatibilité ?',
+      false,
+    );
+    if (!shouldContinue) {
+      const shouldUpdate = await UI.confirm(
+        'Voulez-vous utiliser les versions compatibles suggérées ?',
+      );
+      if (shouldUpdate) {
+        for (const issue of compatibilityIssues) {
+          if (issue.compatibleVersions.length > 0) {
+            depsToInstall[issue.pkg] = issue.compatibleVersions[0];
+            console.log(
+              `Utilisation de ${issue.pkg}@${issue.compatibleVersions[0]} à la place`
+                .success,
+            );
+          }
+        }
+      } else {
+        return;
+      }
+    }
+  }
 
   const isDev = await UI.confirm(
     'Ce sont des dépendances de développement ?',
@@ -375,7 +717,6 @@ async function handleDependencyInstallation(packageManager) {
         isDev,
       );
 
-      // Afficher les résultats
       UI.title("RÉSULTATS DE L'INSTALLATION");
       results.forEach(result => {
         if (result.status === 'success') {
@@ -453,75 +794,50 @@ async function handleVersionComparison(packageManager, hasPackageJson) {
   }
 }
 
-async function readMultiLineInput() {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+// Point d'entrée principal
+async function main() {
+  console.clear();
+  UI.title('MISE À JOUR DE PROJET - DEEPSEEK');
 
-  console.log('\nEntrez les dépendances (format: nom@version) :');
+  const packageManager = new PackageManager();
+  const hasPackageJson = await packageManager.loadPackageJson();
 
-  return new Promise(resolve => {
-    const lines = [];
-
-    rl.on('line', line => {
-      if (line.trim() === '' && lines.length > 0) {
-        rl.close();
-        resolve(lines);
-      } else if (line.trim() !== '') {
-        lines.push(line.trim());
-      }
-    });
-
-    // Timeout après 30 secondes d'inactivité
-    setTimeout(() => {
-      if (lines.length > 0) {
-        rl.close();
-        resolve(lines);
-      }
-    }, 30000);
-  });
-}
-
-async function generateReport() {
-  UI.title('RAPPORT FINAL');
-
-  if (STATE.updatedPackages.length > 0) {
-    console.log('\nPACKAGES MIS À JOUR:'.success.bold);
-    STATE.updatedPackages.forEach(pkg => {
-      console.log(`- ${pkg.name.highlight}: ${pkg.from} → ${pkg.to}`);
-    });
+  if (hasPackageJson) {
+    EnvironmentManager.detectEnvironment(packageManager.packageData);
   }
 
-  if (STATE.skippedPackages.length > 0) {
-    console.log('\nPACKAGES NON MODIFIÉS:'.info.bold);
-    STATE.skippedPackages.forEach(pkg => {
-      console.log(`- ${pkg.name}: ${pkg.version}`);
-    });
+  console.log('\nBonjour, choisissez une option :'.info.bold);
+  console.log('1. Mettre à jour le package.json'.highlight);
+  console.log('2. Installer des dépendances'.highlight);
+  console.log('3. Comparer et mettre à jour les versions'.highlight);
+  console.log('4. Structurer le projet'.highlight);
+
+  const choice = await UI.ask('\nVotre choix (1-4) : ');
+
+  switch (choice) {
+    case '1':
+      await handlePackageJsonUpdate(packageManager, hasPackageJson);
+      break;
+    case '2':
+      await handleDependencyInstallation(packageManager);
+      break;
+    case '3':
+      await handleVersionComparison(packageManager, hasPackageJson);
+      break;
+    case '4':
+      await ProjectStructureManager.createStructure();
+      break;
+    default:
+      console.log('Option invalide'.error);
+      process.exit(1);
   }
 
-  if (STATE.createdFiles.length > 0) {
-    console.log('\nFICHIERS/DOOSSIERS CRÉÉS:'.info.bold);
-    STATE.createdFiles.forEach(file => {
-      console.log(`- ${file}`);
-    });
-  }
-
-  if (STATE.errors.length > 0) {
-    console.log('\nERREURS:'.error.bold);
-    STATE.errors.forEach((error, i) => {
-      console.log(`${i + 1}) ${error}`);
-    });
-  }
-
-  const duration = (new Date() - STATE.startTime) / 1000;
-  console.log(`\nTemps d'exécution: ${duration.toFixed(2)} secondes`.muted);
+  await generateReport();
 }
 
 // Démarrer l'application
 (async () => {
   try {
-    // Vérifier et installer les dépendances requises si nécessaire
     try {
       require('semver');
       require('colors');
