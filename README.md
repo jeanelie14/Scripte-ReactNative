@@ -6,6 +6,7 @@ const readline = require('readline');
 const semver = require('semver');
 const colors = require('colors');
 const fetch = require('node-fetch');
+const ProgressBar = require('progress');
 
 // Configuration
 const CONFIG = {
@@ -22,6 +23,7 @@ colors.setTheme({
   info: 'cyan',
   highlight: 'magenta',
   muted: 'gray',
+  progress: 'blue',
 });
 
 // État global
@@ -36,6 +38,9 @@ const STATE = {
   androidConfig: null,
   reactVersion: null,
   reactNativeVersion: null,
+  fileChanges: [],
+  totalFilesScanned: 0,
+  progressBar: null,
 };
 
 // Interface utilisateur
@@ -70,6 +75,57 @@ class UI {
     this.separator();
     console.log(` ${message} `.highlight.bold);
     this.separator();
+  }
+
+  static createProgressBar(total, message) {
+    const bar = new ProgressBar(
+      ` ${message} [:bar] :current/:total (:percent) :etas`,
+      {
+        complete: '=',
+        incomplete: ' ',
+        width: 40,
+        total: total,
+      },
+    );
+
+    STATE.progressBar = bar;
+    return bar;
+  }
+
+  static updateProgress(current, total) {
+    if (STATE.progressBar) {
+      STATE.progressBar.total = total;
+      STATE.progressBar.update(current / total);
+    } else {
+      process.stdout.write(`\rScanning files: ${current}/${total}`.progress);
+    }
+  }
+
+  static completeProgress() {
+    if (STATE.progressBar) {
+      STATE.progressBar.terminate();
+    } else {
+      process.stdout.write('\n');
+    }
+  }
+}
+
+// Gestionnaire de fichiers modifiés
+class FileChangeTracker {
+  static recordChange(filePath, changeType, details = {}) {
+    const change = {
+      filePath,
+      changeType,
+      timestamp: new Date(),
+      ...details,
+    };
+
+    STATE.fileChanges.push(change);
+    return change;
+  }
+
+  static getChanges() {
+    return STATE.fileChanges;
   }
 }
 
@@ -108,16 +164,22 @@ class ProjectStructureManager {
           const dir = path.dirname(fullPath);
           if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, {recursive: true});
+            FileChangeTracker.recordChange(dir, 'directory_created');
           }
           fs.writeFileSync(fullPath, '');
+          FileChangeTracker.recordChange(fullPath, 'file_created');
           STATE.createdFiles.push(`Fichier créé: ${item}`);
         } else {
           // C'est un dossier
           fs.mkdirSync(fullPath, {recursive: true});
+          FileChangeTracker.recordChange(fullPath, 'directory_created');
           STATE.createdFiles.push(`Dossier créé: ${item}`);
         }
       } catch (error) {
         STATE.errors.push(`Erreur création ${item}: ${error.message}`);
+        FileChangeTracker.recordChange(fullPath, 'creation_error', {
+          error: error.message,
+        });
       }
     }
 
@@ -149,6 +211,9 @@ class EnvironmentManager {
         const versionMatch = content.match(/gradle-(\d+\.\d+(\.\d+)?)-/);
         if (versionMatch) {
           STATE.gradleVersion = versionMatch[1];
+          FileChangeTracker.recordChange(wrapperPropsPath, 'file_scanned', {
+            detectedVersion: versionMatch[1],
+          });
         }
       }
     } catch (error) {
@@ -345,6 +410,7 @@ class PackageManager {
           fs.readFileSync(this.packageJsonPath, 'utf8'),
         );
         this.originalPackageData = JSON.parse(JSON.stringify(this.packageData));
+        FileChangeTracker.recordChange(this.packageJsonPath, 'file_scanned');
         return true;
       }
       return false;
@@ -355,14 +421,42 @@ class PackageManager {
 
   async savePackageJson() {
     try {
-      fs.writeFileSync(
-        this.packageJsonPath,
-        JSON.stringify(this.packageData, null, 2),
-      );
+      const oldContent = JSON.stringify(this.originalPackageData, null, 2);
+      const newContent = JSON.stringify(this.packageData, null, 2);
+
+      fs.writeFileSync(this.packageJsonPath, newContent);
+
+      // Trouver les différences
+      const diff = this.findDifferences(oldContent, newContent);
+      FileChangeTracker.recordChange(this.packageJsonPath, 'file_modified', {
+        changes: diff,
+      });
+
       return true;
     } catch (error) {
       throw new Error(`Erreur d'écriture du package.json: ${error.message}`);
     }
+  }
+
+  findDifferences(oldContent, newContent) {
+    const oldLines = oldContent.split('\n');
+    const newLines = newContent.split('\n');
+    const differences = [];
+
+    for (let i = 0; i < Math.max(oldLines.length, newLines.length); i++) {
+      const oldLine = oldLines[i] || '';
+      const newLine = newLines[i] || '';
+
+      if (oldLine.trim() !== newLine.trim()) {
+        differences.push({
+          lineNumber: i + 1,
+          oldValue: oldLine.trim(),
+          newValue: newLine.trim(),
+        });
+      }
+    }
+
+    return differences;
   }
 
   async updateDependencies(dependencies, isDev = false) {
@@ -530,6 +624,273 @@ class NpmApi {
   }
 }
 
+// Gestionnaire des fichiers Android
+class AndroidFilesUpdater {
+  static async updateAndroidFiles() {
+    UI.title('MISE À JOUR DES FICHIERS ANDROID');
+
+    if (!STATE.reactNativeVersion) {
+      console.log('React Native non détecté dans le projet'.warning);
+      return;
+    }
+
+    const androidDir = path.join(process.cwd(), 'android');
+    if (!fs.existsSync(androidDir)) {
+      console.log('Dossier Android non trouvé'.warning);
+      return;
+    }
+
+    console.log(
+      `Version React Native détectée: ${STATE.reactNativeVersion.highlight}`,
+    );
+
+    try {
+      const recommendedVersions = await this.fetchRecommendedVersions(
+        STATE.reactNativeVersion,
+      );
+
+      console.log('\nVersions recommandées:'.info);
+      console.log(`- Gradle: ${recommendedVersions.gradle}`);
+      console.log(`- Kotlin: ${recommendedVersions.kotlin}`);
+      console.log(
+        `- Android Gradle Plugin: ${recommendedVersions.androidGradlePlugin}`,
+      );
+
+      const shouldProceed = await UI.confirm(
+        '\nVoulez-vous mettre à jour les fichiers Android ?',
+        true,
+      );
+      if (!shouldProceed) return;
+
+      // Scanner tous les fichiers Android avant modification
+      await this.scanAndroidFiles(androidDir);
+
+      await this.updateGradleWrapper(androidDir, recommendedVersions.gradle);
+      await this.updateProjectBuildGradle(
+        androidDir,
+        recommendedVersions.androidGradlePlugin,
+        recommendedVersions.kotlin,
+      );
+      await this.updateGradleProperties(androidDir, recommendedVersions);
+
+      console.log(
+        '\nMise à jour des fichiers Android terminée avec succès!'.success,
+      );
+
+      const shouldRunClean = await UI.confirm(
+        'Voulez-vous exécuter "gradlew clean" maintenant ?',
+        true,
+      );
+
+      if (shouldRunClean) {
+        try {
+          console.log('Exécution de gradlew clean...'.info);
+          execSync('cd android && ./gradlew clean --no-daemon --stacktrace', {
+            stdio: 'inherit',
+            timeout: 600000,
+          });
+          console.log('Nettoyage Gradle terminé avec succès'.success);
+        } catch (error) {
+          console.log('Erreur lors du nettoyage Gradle:'.error, error.message);
+          STATE.errors.push(`Erreur gradlew clean: ${error.message}`);
+        }
+      } else {
+        console.log(
+          'Exécutez manuellement "cd android && ./gradlew clean" pour terminer la configuration'
+            .info,
+        );
+      }
+    } catch (error) {
+      console.log(`Erreur lors de la mise à jour: ${error.message}`.error);
+      STATE.errors.push(`Erreur mise à jour Android: ${error.message}`);
+    }
+  }
+
+  static async scanAndroidFiles(androidDir) {
+    const filesToScan = [
+      'gradle-wrapper.properties',
+      'build.gradle',
+      'gradle.properties',
+      'app/build.gradle',
+      'settings.gradle',
+    ];
+
+    const bar = UI.createProgressBar(
+      filesToScan.length,
+      'Scanning Android files',
+    );
+
+    for (const file of filesToScan) {
+      const filePath = path.join(androidDir, file);
+      if (fs.existsSync(filePath)) {
+        FileChangeTracker.recordChange(filePath, 'file_scanned');
+      }
+      STATE.totalFilesScanned++;
+      UI.updateProgress(STATE.totalFilesScanned, filesToScan.length);
+    }
+
+    UI.completeProgress();
+  }
+
+  static async fetchRecommendedVersions(rnVersion) {
+    try {
+      // Versions recommandées pour React Native 0.76+
+      const recommendedVersions = {
+        gradle: '8.3',
+        kotlin: '1.9.20',
+        androidGradlePlugin: '8.1.1',
+      };
+
+      // Fallback pour les versions plus anciennes
+      const versionMap = {
+        0.72: {
+          gradle: '7.5.1',
+          kotlin: '1.7.20',
+          androidGradlePlugin: '7.3.1',
+        },
+        0.71: {
+          gradle: '7.4.2',
+          kotlin: '1.7.20',
+          androidGradlePlugin: '7.3.0',
+        },
+        '0.70': {
+          gradle: '7.3.1',
+          kotlin: '1.7.10',
+          androidGradlePlugin: '7.2.2',
+        },
+      };
+
+      const majorMinor = rnVersion.split('.').slice(0, 2).join('.');
+      return versionMap[majorMinor] || recommendedVersions;
+    } catch (error) {
+      console.log('Utilisation des versions par défaut'.warning);
+      return {
+        gradle: '8.3',
+        kotlin: '1.9.20',
+        androidGradlePlugin: '8.1.1',
+      };
+    }
+  }
+
+  static async updateGradleWrapper(androidDir, gradleVersion) {
+    const wrapperPropsPath = path.join(
+      androidDir,
+      'gradle',
+      'wrapper',
+      'gradle-wrapper.properties',
+    );
+
+    if (!fs.existsSync(wrapperPropsPath)) {
+      console.log('Fichier gradle-wrapper.properties non trouvé'.warning);
+      return;
+    }
+
+    let content = fs.readFileSync(wrapperPropsPath, 'utf8');
+    const newDistUrl = `https\\://services.gradle.org/distributions/gradle-${gradleVersion}-all.zip`;
+
+    content = content.replace(
+      /distributionUrl=.*gradle-.*-all\.zip/,
+      `distributionUrl=${newDistUrl}`,
+    );
+
+    fs.writeFileSync(wrapperPropsPath, content);
+    console.log(
+      `gradle-wrapper.properties mis à jour avec Gradle ${gradleVersion}`
+        .success,
+    );
+    FileChangeTracker.recordChange(wrapperPropsPath, 'file_modified', {
+      newGradleVersion: gradleVersion,
+    });
+  }
+
+  static async updateProjectBuildGradle(
+    androidDir,
+    androidGradlePluginVersion,
+    kotlinVersion,
+  ) {
+    const buildGradlePath = path.join(androidDir, 'build.gradle');
+
+    if (!fs.existsSync(buildGradlePath)) {
+      console.log('Fichier build.gradle (project) non trouvé'.warning);
+      return;
+    }
+
+    let content = fs.readFileSync(buildGradlePath, 'utf8');
+    const oldContent = content;
+
+    content = content.replace(
+      /classpath\("com\.android\.tools\.build:gradle:.*"\)/,
+      `classpath("com.android.tools.build:gradle:${androidGradlePluginVersion}")`,
+    );
+
+    content = content.replace(
+      /classpath\("org\.jetbrains\.kotlin:kotlin-gradle-plugin:.*"\)/,
+      `classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:${kotlinVersion}")`,
+    );
+
+    if (content !== oldContent) {
+      fs.writeFileSync(buildGradlePath, content);
+      console.log('build.gradle (project) mis à jour'.success);
+      FileChangeTracker.recordChange(buildGradlePath, 'file_modified', {
+        androidGradlePluginVersion,
+        kotlinVersion,
+      });
+    }
+  }
+
+  static async updateGradleProperties(androidDir, versions) {
+    const gradlePropsPath = path.join(androidDir, 'gradle.properties');
+
+    if (!fs.existsSync(gradlePropsPath)) {
+      console.log('Fichier gradle.properties non trouvé'.warning);
+      return;
+    }
+
+    let content = fs.readFileSync(gradlePropsPath, 'utf8');
+    const oldContent = content;
+
+    if (!content.includes('kotlin.version')) {
+      content += `\nkotlin.version=${versions.kotlin}\n`;
+    } else {
+      content = content.replace(
+        /kotlin\.version=.*/,
+        `kotlin.version=${versions.kotlin}`,
+      );
+    }
+
+    const recommendedConfigs = [
+      'android.useAndroidX=true',
+      'android.enableJetifier=true',
+      'org.gradle.jvmargs=-Xmx2048m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8',
+      'org.gradle.parallel=true',
+      'org.gradle.daemon=true',
+      'org.gradle.configureondemand=true',
+    ];
+
+    recommendedConfigs.forEach(config => {
+      const [key] = config.split('=');
+      const regex = new RegExp(`${key}=.*`);
+
+      if (!content.includes(key)) {
+        content += `\n${config}\n`;
+      } else if (regex.test(content)) {
+        content = content.replace(regex, config);
+      }
+    });
+
+    content = content.replace(
+      /org\.gradle\.jvmargs=.*-XX:MaxPermSize=\d+m/g,
+      '',
+    );
+
+    if (content !== oldContent) {
+      fs.writeFileSync(gradlePropsPath, content);
+      console.log('gradle.properties mis à jour'.success);
+      FileChangeTracker.recordChange(gradlePropsPath, 'file_modified');
+    }
+  }
+}
+
 // Fonctions utilitaires
 async function readMultiLineInput() {
   const rl = readline.createInterface({
@@ -582,6 +943,32 @@ async function generateReport() {
     });
   }
 
+  if (STATE.fileChanges.length > 0) {
+    console.log('\nMODIFICATIONS DE FICHIERS:'.highlight.bold);
+    STATE.fileChanges.forEach(change => {
+      console.log(`\nChemin: ${change.filePath}`);
+      console.log(`Type: ${change.changeType}`);
+
+      if (change.changeType === 'file_modified' && change.changes) {
+        console.log('Changements:');
+        change.changes.forEach(diff => {
+          console.log(`  Ligne ${diff.lineNumber}:`);
+          if (diff.oldValue) console.log(`    - ${diff.oldValue}`.error);
+          if (diff.newValue) console.log(`    + ${diff.newValue}`.success);
+        });
+      } else if (change.detectedVersion) {
+        console.log(`Version détectée: ${change.detectedVersion}`);
+      } else if (change.newGradleVersion) {
+        console.log(`Nouvelle version Gradle: ${change.newGradleVersion}`);
+      } else if (change.androidGradlePluginVersion) {
+        console.log(
+          `Nouvelle version Android Gradle Plugin: ${change.androidGradlePluginVersion}`,
+        );
+        console.log(`Nouvelle version Kotlin: ${change.kotlinVersion}`);
+      }
+    });
+  }
+
   if (STATE.errors.length > 0) {
     console.log('\nERREURS:'.error.bold);
     STATE.errors.forEach((error, i) => {
@@ -589,8 +976,9 @@ async function generateReport() {
     });
   }
 
+  console.log(`\nTotal fichiers scannés: ${STATE.totalFilesScanned}`.info);
   const duration = (new Date() - STATE.startTime) / 1000;
-  console.log(`\nTemps d'exécution: ${duration.toFixed(2)} secondes`.muted);
+  console.log(`Temps d'exécution: ${duration.toFixed(2)} secondes`.muted);
 }
 
 // Fonctions principales
@@ -794,221 +1182,19 @@ async function handleVersionComparison(packageManager, hasPackageJson) {
   }
 }
 
-// Gestionnaire des fichiers Android
-class AndroidFilesUpdater {
-  static async updateAndroidFiles() {
-    UI.title('MISE À JOUR DES FICHIERS ANDROID');
-
-    if (!STATE.reactNativeVersion) {
-      console.log('React Native non détecté dans le projet'.warning);
-      return;
-    }
-
-    const androidDir = path.join(process.cwd(), 'android');
-    if (!fs.existsSync(androidDir)) {
-      console.log('Dossier Android non trouvé'.warning);
-      return;
-    }
-
-    console.log(`Version React Native détectée: ${STATE.reactNativeVersion.highlight}`);
-
-    try {
-      const recommendedVersions = await this.fetchRecommendedVersions(
-        STATE.reactNativeVersion,
-      );
-
-      console.log('\nVersions recommandées:'.info);
-      console.log(`- Gradle: ${recommendedVersions.gradle}`);
-      console.log(`- Kotlin: ${recommendedVersions.kotlin}`);
-      console.log(`- Android Gradle Plugin: ${recommendedVersions.androidGradlePlugin}`);
-
-      const shouldProceed = await UI.confirm(
-        '\nVoulez-vous mettre à jour les fichiers Android ?',
-        true
-      );
-      if (!shouldProceed) return;
-
-      await this.updateGradleWrapper(androidDir, recommendedVersions.gradle);
-      await this.updateProjectBuildGradle(
-        androidDir,
-        recommendedVersions.androidGradlePlugin,
-        recommendedVersions.kotlin,
-      );
-      await this.updateGradleProperties(androidDir, recommendedVersions);
-
-      console.log('\nMise à jour des fichiers Android terminée avec succès!'.success);
-      
-      const shouldRunClean = await UI.confirm(
-        'Voulez-vous exécuter "gradlew clean" maintenant ?',
-        true
-      );
-      
-      if (shouldRunClean) {
-        try {
-          console.log('Exécution de gradlew clean...'.info);
-          execSync('cd android && ./gradlew clean --no-daemon --stacktrace', {
-            stdio: 'inherit',
-            timeout: 600000
-          });
-          console.log('Nettoyage Gradle terminé avec succès'.success);
-        } catch (error) {
-          console.log('Erreur lors du nettoyage Gradle:'.error, error.message);
-          STATE.errors.push(`Erreur gradlew clean: ${error.message}`);
-        }
-      } else {
-        console.log(
-          'Exécutez manuellement "cd android && ./gradlew clean" pour terminer la configuration'.info,
-        );
-      }
-    } catch (error) {
-      console.log(`Erreur lors de la mise à jour: ${error.message}`.error);
-      STATE.errors.push(`Erreur mise à jour Android: ${error.message}`);
-    }
-  }
-
-  static async fetchRecommendedVersions(rnVersion) {
-    try {
-      // Versions recommandées pour React Native 0.76+
-      const recommendedVersions = {
-        gradle: '8.3',
-        kotlin: '1.9.20',
-        androidGradlePlugin: '8.1.1'
-      };
-
-      // Fallback pour les versions plus anciennes
-      const versionMap = {
-        '0.72': {
-          gradle: '7.5.1',
-          kotlin: '1.7.20',
-          androidGradlePlugin: '7.3.1'
-        },
-        '0.71': {
-          gradle: '7.4.2',
-          kotlin: '1.7.20',
-          androidGradlePlugin: '7.3.0'
-        },
-        '0.70': {
-          gradle: '7.3.1',
-          kotlin: '1.7.10',
-          androidGradlePlugin: '7.2.2'
-        }
-      };
-
-      const majorMinor = rnVersion.split('.').slice(0, 2).join('.');
-      return versionMap[majorMinor] || recommendedVersions;
-    } catch (error) {
-      console.log('Utilisation des versions par défaut'.warning);
-      return {
-        gradle: '8.3',
-        kotlin: '1.9.20',
-        androidGradlePlugin: '8.1.1'
-      };
-    }
-  }
-
-  static async updateGradleWrapper(androidDir, gradleVersion) {
-    const wrapperPropsPath = path.join(
-      androidDir,
-      'gradle',
-      'wrapper',
-      'gradle-wrapper.properties',
-    );
-
-    if (!fs.existsSync(wrapperPropsPath)) {
-      console.log('Fichier gradle-wrapper.properties non trouvé'.warning);
-      return;
-    }
-
-    let content = fs.readFileSync(wrapperPropsPath, 'utf8');
-    const newDistUrl = `https\\://services.gradle.org/distributions/gradle-${gradleVersion}-all.zip`;
-
-    content = content.replace(
-      /distributionUrl=.*gradle-.*-all\.zip/,
-      `distributionUrl=${newDistUrl}`,
-    );
-
-    fs.writeFileSync(wrapperPropsPath, content);
-    console.log(`gradle-wrapper.properties mis à jour avec Gradle ${gradleVersion}`.success);
-  }
-
-  static async updateProjectBuildGradle(
-    androidDir,
-    androidGradlePluginVersion,
-    kotlinVersion,
-  ) {
-    const buildGradlePath = path.join(androidDir, 'build.gradle');
-
-    if (!fs.existsSync(buildGradlePath)) {
-      console.log('Fichier build.gradle (project) non trouvé'.warning);
-      return;
-    }
-
-    let content = fs.readFileSync(buildGradlePath, 'utf8');
-
-    content = content.replace(
-      /classpath\("com\.android\.tools\.build:gradle:.*"\)/,
-      `classpath("com.android.tools.build:gradle:${androidGradlePluginVersion}")`,
-    );
-
-    content = content.replace(
-      /classpath\("org\.jetbrains\.kotlin:kotlin-gradle-plugin:.*"\)/,
-      `classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:${kotlinVersion}")`,
-    );
-
-    fs.writeFileSync(buildGradlePath, content);
-    console.log('build.gradle (project) mis à jour'.success);
-  }
-
-  static async updateGradleProperties(androidDir, versions) {
-    const gradlePropsPath = path.join(androidDir, 'gradle.properties');
-    
-    if (!fs.existsSync(gradlePropsPath)) {
-      console.log('Fichier gradle.properties non trouvé'.warning);
-      return;
-    }
-
-    let content = fs.readFileSync(gradlePropsPath, 'utf8');
-    
-    if (!content.includes('kotlin.version')) {
-      content += `\nkotlin.version=${versions.kotlin}\n`;
-    } else {
-      content = content.replace(
-        /kotlin\.version=.*/,
-        `kotlin.version=${versions.kotlin}`
-      );
-    }
-    
-    const recommendedConfigs = [
-      'android.useAndroidX=true',
-      'android.enableJetifier=true',
-      'org.gradle.jvmargs=-Xmx2048m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8',
-      'org.gradle.parallel=true',
-      'org.gradle.daemon=true',
-      'org.gradle.configureondemand=true'
-    ];
-    
-    recommendedConfigs.forEach(config => {
-      const [key] = config.split('=');
-      const regex = new RegExp(`${key}=.*`);
-      
-      if (!content.includes(key)) {
-        content += `\n${config}\n`;
-      } else if (regex.test(content)) {
-        content = content.replace(regex, config);
-      }
-    });
-
-    content = content.replace(/org\.gradle\.jvmargs=.*-XX:MaxPermSize=\d+m/g, '');
-
-    fs.writeFileSync(gradlePropsPath, content);
-    console.log('gradle.properties mis à jour'.success);
-  }
-}
-
 // Point d'entrée principal
 async function main() {
   console.clear();
   UI.title('MISE À JOUR DE PROJET - DEEPSEEK');
+
+  try {
+    require('progress');
+  } catch {
+    console.log('Installation de la dépendance "progress"...'.info);
+    execSync('npm install progress --no-save --legacy-peer-deps', {
+      stdio: 'inherit',
+    });
+  }
 
   const packageManager = new PackageManager();
   const hasPackageJson = await packageManager.loadPackageJson();
@@ -1057,10 +1243,11 @@ async function main() {
       require('semver');
       require('colors');
       require('node-fetch');
+      require('progress');
     } catch {
       console.log('Installation des dépendances requises...'.info);
       execSync(
-        'npm install semver colors node-fetch --no-save --legacy-peer-deps',
+        'npm install semver colors node-fetch progress --no-save --legacy-peer-deps',
         {stdio: 'inherit'},
       );
     }
