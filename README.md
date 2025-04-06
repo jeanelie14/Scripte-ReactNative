@@ -794,6 +794,217 @@ async function handleVersionComparison(packageManager, hasPackageJson) {
   }
 }
 
+// Gestionnaire des fichiers Android
+class AndroidFilesUpdater {
+  static async updateAndroidFiles() {
+    UI.title('MISE À JOUR DES FICHIERS ANDROID');
+
+    if (!STATE.reactNativeVersion) {
+      console.log('React Native non détecté dans le projet'.warning);
+      return;
+    }
+
+    const androidDir = path.join(process.cwd(), 'android');
+    if (!fs.existsSync(androidDir)) {
+      console.log('Dossier Android non trouvé'.warning);
+      return;
+    }
+
+    console.log(`Version React Native détectée: ${STATE.reactNativeVersion.highlight}`);
+
+    try {
+      const recommendedVersions = await this.fetchRecommendedVersions(
+        STATE.reactNativeVersion,
+      );
+
+      console.log('\nVersions recommandées:'.info);
+      console.log(`- Gradle: ${recommendedVersions.gradle}`);
+      console.log(`- Kotlin: ${recommendedVersions.kotlin}`);
+      console.log(`- Android Gradle Plugin: ${recommendedVersions.androidGradlePlugin}`);
+
+      const shouldProceed = await UI.confirm(
+        '\nVoulez-vous mettre à jour les fichiers Android ?',
+        true
+      );
+      if (!shouldProceed) return;
+
+      await this.updateGradleWrapper(androidDir, recommendedVersions.gradle);
+      await this.updateProjectBuildGradle(
+        androidDir,
+        recommendedVersions.androidGradlePlugin,
+        recommendedVersions.kotlin,
+      );
+      await this.updateGradleProperties(androidDir, recommendedVersions);
+
+      console.log('\nMise à jour des fichiers Android terminée avec succès!'.success);
+      
+      const shouldRunClean = await UI.confirm(
+        'Voulez-vous exécuter "gradlew clean" maintenant ?',
+        true
+      );
+      
+      if (shouldRunClean) {
+        try {
+          console.log('Exécution de gradlew clean...'.info);
+          execSync('cd android && ./gradlew clean --no-daemon --stacktrace', {
+            stdio: 'inherit',
+            timeout: 600000
+          });
+          console.log('Nettoyage Gradle terminé avec succès'.success);
+        } catch (error) {
+          console.log('Erreur lors du nettoyage Gradle:'.error, error.message);
+          STATE.errors.push(`Erreur gradlew clean: ${error.message}`);
+        }
+      } else {
+        console.log(
+          'Exécutez manuellement "cd android && ./gradlew clean" pour terminer la configuration'.info,
+        );
+      }
+    } catch (error) {
+      console.log(`Erreur lors de la mise à jour: ${error.message}`.error);
+      STATE.errors.push(`Erreur mise à jour Android: ${error.message}`);
+    }
+  }
+
+  static async fetchRecommendedVersions(rnVersion) {
+    try {
+      // Versions recommandées pour React Native 0.76+
+      const recommendedVersions = {
+        gradle: '8.3',
+        kotlin: '1.9.20',
+        androidGradlePlugin: '8.1.1'
+      };
+
+      // Fallback pour les versions plus anciennes
+      const versionMap = {
+        '0.72': {
+          gradle: '7.5.1',
+          kotlin: '1.7.20',
+          androidGradlePlugin: '7.3.1'
+        },
+        '0.71': {
+          gradle: '7.4.2',
+          kotlin: '1.7.20',
+          androidGradlePlugin: '7.3.0'
+        },
+        '0.70': {
+          gradle: '7.3.1',
+          kotlin: '1.7.10',
+          androidGradlePlugin: '7.2.2'
+        }
+      };
+
+      const majorMinor = rnVersion.split('.').slice(0, 2).join('.');
+      return versionMap[majorMinor] || recommendedVersions;
+    } catch (error) {
+      console.log('Utilisation des versions par défaut'.warning);
+      return {
+        gradle: '8.3',
+        kotlin: '1.9.20',
+        androidGradlePlugin: '8.1.1'
+      };
+    }
+  }
+
+  static async updateGradleWrapper(androidDir, gradleVersion) {
+    const wrapperPropsPath = path.join(
+      androidDir,
+      'gradle',
+      'wrapper',
+      'gradle-wrapper.properties',
+    );
+
+    if (!fs.existsSync(wrapperPropsPath)) {
+      console.log('Fichier gradle-wrapper.properties non trouvé'.warning);
+      return;
+    }
+
+    let content = fs.readFileSync(wrapperPropsPath, 'utf8');
+    const newDistUrl = `https\\://services.gradle.org/distributions/gradle-${gradleVersion}-all.zip`;
+
+    content = content.replace(
+      /distributionUrl=.*gradle-.*-all\.zip/,
+      `distributionUrl=${newDistUrl}`,
+    );
+
+    fs.writeFileSync(wrapperPropsPath, content);
+    console.log(`gradle-wrapper.properties mis à jour avec Gradle ${gradleVersion}`.success);
+  }
+
+  static async updateProjectBuildGradle(
+    androidDir,
+    androidGradlePluginVersion,
+    kotlinVersion,
+  ) {
+    const buildGradlePath = path.join(androidDir, 'build.gradle');
+
+    if (!fs.existsSync(buildGradlePath)) {
+      console.log('Fichier build.gradle (project) non trouvé'.warning);
+      return;
+    }
+
+    let content = fs.readFileSync(buildGradlePath, 'utf8');
+
+    content = content.replace(
+      /classpath\("com\.android\.tools\.build:gradle:.*"\)/,
+      `classpath("com.android.tools.build:gradle:${androidGradlePluginVersion}")`,
+    );
+
+    content = content.replace(
+      /classpath\("org\.jetbrains\.kotlin:kotlin-gradle-plugin:.*"\)/,
+      `classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:${kotlinVersion}")`,
+    );
+
+    fs.writeFileSync(buildGradlePath, content);
+    console.log('build.gradle (project) mis à jour'.success);
+  }
+
+  static async updateGradleProperties(androidDir, versions) {
+    const gradlePropsPath = path.join(androidDir, 'gradle.properties');
+    
+    if (!fs.existsSync(gradlePropsPath)) {
+      console.log('Fichier gradle.properties non trouvé'.warning);
+      return;
+    }
+
+    let content = fs.readFileSync(gradlePropsPath, 'utf8');
+    
+    if (!content.includes('kotlin.version')) {
+      content += `\nkotlin.version=${versions.kotlin}\n`;
+    } else {
+      content = content.replace(
+        /kotlin\.version=.*/,
+        `kotlin.version=${versions.kotlin}`
+      );
+    }
+    
+    const recommendedConfigs = [
+      'android.useAndroidX=true',
+      'android.enableJetifier=true',
+      'org.gradle.jvmargs=-Xmx2048m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8',
+      'org.gradle.parallel=true',
+      'org.gradle.daemon=true',
+      'org.gradle.configureondemand=true'
+    ];
+    
+    recommendedConfigs.forEach(config => {
+      const [key] = config.split('=');
+      const regex = new RegExp(`${key}=.*`);
+      
+      if (!content.includes(key)) {
+        content += `\n${config}\n`;
+      } else if (regex.test(content)) {
+        content = content.replace(regex, config);
+      }
+    });
+
+    content = content.replace(/org\.gradle\.jvmargs=.*-XX:MaxPermSize=\d+m/g, '');
+
+    fs.writeFileSync(gradlePropsPath, content);
+    console.log('gradle.properties mis à jour'.success);
+  }
+}
+
 // Point d'entrée principal
 async function main() {
   console.clear();
@@ -811,8 +1022,9 @@ async function main() {
   console.log('2. Installer des dépendances'.highlight);
   console.log('3. Comparer et mettre à jour les versions'.highlight);
   console.log('4. Structurer le projet'.highlight);
+  console.log('5. Mettre à jour les fichiers Android'.highlight);
 
-  const choice = await UI.ask('\nVotre choix (1-4) : ');
+  const choice = await UI.ask('\nVotre choix (1-5) : ');
 
   switch (choice) {
     case '1':
@@ -826,6 +1038,9 @@ async function main() {
       break;
     case '4':
       await ProjectStructureManager.createStructure();
+      break;
+    case '5':
+      await AndroidFilesUpdater.updateAndroidFiles();
       break;
     default:
       console.log('Option invalide'.error);
